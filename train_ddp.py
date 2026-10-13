@@ -1,4 +1,4 @@
-%%writefile train_ddp.py
+# %%writefile train_ddp.py
 import os
 import time
 import torch
