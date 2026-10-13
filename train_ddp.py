@@ -1,13 +1,14 @@
+%%writefile train_ddp.py
 import os
 import time
 import torch
+from torch.optim import AdamW
 import evaluate
 from torch.utils.data import DataLoader
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer, 
     AutoModelForSequenceClassification, 
-    AdamW, 
     get_linear_schedule_with_warmup,
     DataCollatorWithPadding
 )
@@ -19,13 +20,11 @@ def log_gpu_memory(accelerator, step_name=""):
     local_rank = accelerator.local_process_index
     device = accelerator.device
     
-    # Synchronize to capture true peak memory usage
     torch.cuda.synchronize(device)
     alloc = torch.cuda.memory_allocated(device) / (1024 ** 2)
     max_alloc = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
     reserved = torch.cuda.memory_reserved(device) / (1024 ** 2)
     
-    # Each rank reports its own memory footprint
     print(
         f"[{step_name}] Rank {local_rank} ({torch.cuda.get_device_name(device)}) -> "
         f"Allocated: {alloc:.1f} MB | Peak: {max_alloc:.1f} MB | Reserved: {reserved:.1f} MB"
@@ -33,19 +32,17 @@ def log_gpu_memory(accelerator, step_name=""):
 
 def main():
     # 1. Initialize Accelerator
-    # mixed_precision="fp16" leverages T4 Tensor Cores for 2-3x speedup and 50% VRAM reduction
     accelerator = Accelerator(mixed_precision="fp16")
     set_seed(42)
 
     accelerator.print(f"=== Starting Distributed Training on {accelerator.num_processes} GPUs ===")
     accelerator.print(f"Distributed Backend: {accelerator.state.distributed_type}")
 
-    # 2. Dataset & Tokenizer (Yelp Review Full: 5-class rating from 0 to 4)
+    # 2. Dataset & Tokenizer (Yelp Review Full: 5 classes)
     model_checkpoint = "bert-base-uncased"
     num_labels = 5
     tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
 
-    # Subsample 8,000 train samples and 2,000 test samples for homework turnaround
     raw_datasets = load_dataset("yelp_review_full")
     train_subset = raw_datasets["train"].shuffle(seed=42).select(range(8000))
     eval_subset = raw_datasets["test"].shuffle(seed=42).select(range(2000))
@@ -59,7 +56,6 @@ def main():
 
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-    # Per-device batch size of 32 -> Effective global batch size = 32 * 2 GPUs = 64
     batch_size = 32
     train_dataloader = DataLoader(
         tokenized_train, 
@@ -79,6 +75,7 @@ def main():
         num_labels=num_labels
     )
     
+    # Using PyTorch native AdamW
     optimizer = AdamW(model.parameters(), lr=3e-5, weight_decay=0.01)
     num_epochs = 3
     total_training_steps = num_epochs * (len(train_dataloader) // accelerator.num_processes)
@@ -88,7 +85,7 @@ def main():
         num_training_steps=total_training_steps
     )
 
-    # 4. Prepare distributed handles (Injects DDP wrapper & DistributedSampler)
+    # 4. Prepare distributed wrappers
     model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
@@ -96,7 +93,7 @@ def main():
     accuracy_metric = evaluate.load("accuracy")
     f1_metric = evaluate.load("f1")
 
-    # 5. Training Loop with Profiling
+    # 5. Training Loop
     for epoch in range(num_epochs):
         model.train()
         epoch_start_time = time.time()
@@ -125,14 +122,13 @@ def main():
             f"Avg Loss: {(running_loss / len(train_dataloader)):.4f}"
         )
 
-        # 6. Evaluation Loop with Cross-GPU Metric Gathering
+        # 6. Evaluation Loop with Distributed Gathering
         model.eval()
         for batch in eval_dataloader:
             with torch.no_grad():
                 outputs = model(**batch)
             
             predictions = outputs.logits.argmax(dim=-1)
-            # Gather predictions across both T4 GPUs to compute global metrics
             gathered_preds, gathered_labels = accelerator.gather_for_metrics(
                 (predictions, batch["label"])
             )
