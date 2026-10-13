@@ -1,4 +1,3 @@
-# %%writefile train_ddp.py
 import os
 import time
 import torch
@@ -38,14 +37,15 @@ def main():
     accelerator.print(f"=== Starting Distributed Training on {accelerator.num_processes} GPUs ===")
     accelerator.print(f"Distributed Backend: {accelerator.state.distributed_type}")
 
-    # 2. Dataset & Tokenizer (Yelp Review Full: 5 classes)
+    # 2. Multi-Class Review Dataset (5 classes: 0 to 4)
     model_checkpoint = "bert-base-uncased"
     num_labels = 5
     tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
 
-    raw_datasets = load_dataset("yelp_review_full")
-    train_subset = raw_datasets["train"].shuffle(seed=42).select(range(8000))
-    eval_subset = raw_datasets["test"].shuffle(seed=42).select(range(2000))
+    # Namespaced 5-class review sentiment dataset
+    raw_datasets = load_dataset("SetFit/sst5")
+    train_subset = raw_datasets["train"].shuffle(seed=42)
+    eval_subset = raw_datasets["test"].shuffle(seed=42)
 
     def tokenize_fn(batch):
         return tokenizer(batch["text"], truncation=True, max_length=128)
@@ -69,13 +69,12 @@ def main():
         collate_fn=data_collator
     )
 
-    # 3. Model, Optimizer, and Scheduler
+    # 3. Model, Optimizer, and Learning Rate Scheduler
     model = AutoModelForSequenceClassification.from_pretrained(
         model_checkpoint, 
         num_labels=num_labels
     )
     
-    # Using PyTorch native AdamW
     optimizer = AdamW(model.parameters(), lr=3e-5, weight_decay=0.01)
     num_epochs = 3
     total_training_steps = num_epochs * (len(train_dataloader) // accelerator.num_processes)
@@ -85,7 +84,7 @@ def main():
         num_training_steps=total_training_steps
     )
 
-    # 4. Prepare distributed wrappers
+    # 4. Prepare distributed objects (Wraps DDP, DistributedSampler, and GPU placement)
     model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
@@ -122,13 +121,14 @@ def main():
             f"Avg Loss: {(running_loss / len(train_dataloader)):.4f}"
         )
 
-        # 6. Evaluation Loop with Distributed Gathering
+        # 6. Multi-GPU Distributed Evaluation
         model.eval()
         for batch in eval_dataloader:
             with torch.no_grad():
                 outputs = model(**batch)
             
             predictions = outputs.logits.argmax(dim=-1)
+            # Gather predictions across GPU 0 and GPU 1
             gathered_preds, gathered_labels = accelerator.gather_for_metrics(
                 (predictions, batch["label"])
             )
@@ -145,6 +145,7 @@ def main():
         )
 
     accelerator.print("=== Distributed Training Finished Successfully ===")
+    accelerator.end_training()
 
 if __name__ == "__main__":
     main()
