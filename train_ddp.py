@@ -2,6 +2,7 @@ import os
 import inspect
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import numpy as np
 import evaluate
 from sklearn.utils.class_weight import compute_class_weight
@@ -16,22 +17,57 @@ from transformers import (
     EarlyStoppingCallback,
     pipeline
 )
+from transformers.trainer_callback import PrinterCallback
 
-# 1. Custom Callback to Monitor Dual T4 VRAM Footprints
-class GpuProfilingCallback(TrainerCallback):
-    """Logs allocated, peak, and reserved VRAM per GPU at the end of each epoch."""
-    def on_epoch_end(self, args, state, control, **kwargs):
-        if torch.cuda.is_available() and args.process_index == 0:
-            print("\n--- GPU Memory Metrics ---")
-            for i in range(torch.cuda.device_count()):
-                torch.cuda.synchronize(i)
-                alloc = torch.cuda.memory_allocated(i) / (1024 ** 2)
-                peak = torch.cuda.max_memory_allocated(i) / (1024 ** 2)
-                res = torch.cuda.memory_reserved(i) / (1024 ** 2)
-                print(f"  GPU {i} ({torch.cuda.get_device_name(i)}) -> Allocated: {alloc:7.1f} MB | Peak: {peak:7.1f} MB | Reserved: {res:7.1f} MB")
-            print("--------------------------\n")
+# 1. Custom Callback for Table Formatting and Cross-Process GPU Profiling
+class DistributedTableLoggerCallback(TrainerCallback):
+    def __init__(self):
+        self.header_printed = False
+        self.latest_train_loss = None
 
-# 2. Custom Trainer with Balanced Class Weighting
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        # Capture training loss from step/epoch logs
+        if logs and "loss" in logs:
+            self.latest_train_loss = logs["loss"]
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        # Synchronize and gather GPU metrics from Rank 0 and Rank 1
+        dev = torch.cuda.current_device()
+        torch.cuda.synchronize(dev)
+        peak_mb = torch.cuda.max_memory_allocated(dev) / (1024 ** 2)
+        local_rank = dist.get_rank() if dist.is_initialized() else 0
+
+        if dist.is_initialized():
+            gathered_peaks = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered_peaks, (local_rank, peak_mb))
+        else:
+            gathered_peaks = [(0, peak_mb)]
+
+        if args.process_index == 0 and metrics:
+            if not self.header_printed:
+                print("\n" + "=" * 94)
+                print(f"| {'Epoch':^7} | {'Train Loss':^10} | {'Val Loss':^10} | {'Val Acc':^9} | {'Macro F1':^10} | {'GPU 0 Peak':^12} | {'GPU 1 Peak':^12} |")
+                print("=" * 94)
+                self.header_printed = True
+
+            epoch = int(state.epoch) if state.epoch is not None else 0
+            tr_loss_str = f"{self.latest_train_loss:.4f}" if self.latest_train_loss is not None else "N/A"
+            val_loss = metrics.get("eval_loss", 0.0)
+            val_acc = metrics.get("eval_accuracy", 0.0)
+            val_f1 = metrics.get("eval_macro_f1", 0.0)
+
+            # Sort gathered peaks by rank index
+            gathered_peaks.sort(key=lambda x: x[0])
+            g0_str = f"{gathered_peaks[0][1]:.0f} MB" if len(gathered_peaks) > 0 else "N/A"
+            g1_str = f"{gathered_peaks[1][1]:.0f} MB" if len(gathered_peaks) > 1 else "N/A"
+
+            row = (
+                f"| {epoch:^7} | {tr_loss_str:^10} | {val_loss:^10.4f} | "
+                f"{val_acc * 100:^8.2f}% | {val_f1:^10.4f} | {g0_str:^12} | {g1_str:^12} |"
+            )
+            print(row)
+
+# 2. Weighted Trainer Handling Class Imbalance
 class WeightedTrainer(Trainer):
     def __init__(self, class_weights=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -39,7 +75,6 @@ class WeightedTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
         labels = inputs.get("labels")
-        # Strip labels from model_inputs so the model doesn't compute redundant unweighted loss
         model_inputs = {k: v for k, v in inputs.items() if k != "labels"}
         outputs = model(**model_inputs)
         logits = outputs.get("logits")
@@ -54,26 +89,18 @@ class WeightedTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 def main():
-    # 3. Label Mappings for dair-ai/emotion (6 Classes)
-    id2label = {
-        0: "sadness", 
-        1: "joy", 
-        2: "love", 
-        3: "anger", 
-        4: "fear", 
-        5: "surprise"
-    }
+    # 3. Label Map & Dataset Setup
+    id2label = {0: "sadness", 1: "joy", 2: "love", 3: "anger", 4: "fear", 5: "surprise"}
     label2id = {v: k for k, v in id2label.items()}
     num_labels = len(id2label)
 
     dataset = load_dataset("dair-ai/emotion")
-    # Standardize label column to 'labels' for Hugging Face models
     dataset = dataset.rename_column("label", "labels")
 
     model_checkpoint = "roberta-base"
     tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
 
-    # 4. Compute Inverse Class Weights to prevent majority-class collapse
+    # 4. Balanced Inverse Class Weights
     train_labels = np.array(dataset["train"]["labels"])
     computed_weights = compute_class_weight(
         class_weight="balanced",
@@ -88,7 +115,7 @@ def main():
     tokenized_datasets = dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-    # 5. Model Initialization with Regularization
+    # 5. Model Initialization
     model = AutoModelForSequenceClassification.from_pretrained(
         model_checkpoint,
         num_labels=num_labels,
@@ -98,7 +125,6 @@ def main():
         hidden_dropout_prob=0.2
     )
 
-    # 6. Evaluation Metrics (Accuracy and Macro F1)
     accuracy_metric = evaluate.load("accuracy")
     f1_metric = evaluate.load("f1")
 
@@ -109,11 +135,8 @@ def main():
         macro_f1 = f1_metric.compute(predictions=preds, references=labels, average="macro")["f1"]
         return {"accuracy": acc, "macro_f1": macro_f1}
 
-    # 7. Configure TrainingArguments with Safe Parameters
+    # 6. Training Arguments
     output_dir = "./best_emotion_model"
-    
-    # 16,000 samples / (32 per GPU * 2 GPUs) = 250 steps/epoch.
-    # For 5 epochs = 1,250 total steps. 10% warmup = 125 steps.
     warmup_steps = 125
 
     training_args_dict = {
@@ -123,19 +146,19 @@ def main():
         "per_device_train_batch_size": 32,
         "per_device_eval_batch_size": 64,
         "num_train_epochs": 5,
-        "weight_decay": 0.05,            # L2 penalty to stop weights from over-memorizing
-        "warmup_steps": warmup_steps,     # Direct steps instead of warmup_ratio
-        "fp16": True,                    # Tensor Core acceleration for T4
-        "load_best_model_at_end": True,   # Automatically restore checkpoint with peak Macro F1
+        "weight_decay": 0.05,
+        "warmup_steps": warmup_steps,
+        "fp16": True,
+        "ddp_find_unused_parameters": False,  # Silences DDP warning and optimizes autograd
+        "load_best_model_at_end": True,
         "metric_for_best_model": "macro_f1",
         "greater_is_better": True,
         "save_total_limit": 1,
         "logging_strategy": "epoch",
-        "disable_tqdm": False,
+        "disable_tqdm": True,                 # Disables raw console clutter for clean table printing
         "report_to": "none"
     }
 
-    # Inspect whether current environment uses eval_strategy (>=4.41) or evaluation_strategy (<4.41)
     sig = inspect.signature(TrainingArguments.__init__).parameters
     if "eval_strategy" in sig:
         training_args_dict["eval_strategy"] = "epoch"
@@ -144,43 +167,42 @@ def main():
 
     training_args = TrainingArguments(**training_args_dict)
 
-    # 8. Instantiate Trainer
+    # 7. Trainer Instantiation
     trainer = WeightedTrainer(
         class_weights=class_weights_tensor,
         model=model,
         args=training_args,
         train_dataset=tokenized_datasets["train"],
         eval_dataset=tokenized_datasets["validation"],
-        processing_class=tokenizer,
+        tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         callbacks=[
-            GpuProfilingCallback(),
+            DistributedTableLoggerCallback(),
             EarlyStoppingCallback(early_stopping_patience=2)
         ]
     )
 
-    # 9. Train Model
+    # Remove the default raw dictionary printer
+    trainer.remove_callback(PrinterCallback)
+
+    # 8. Train Model
     trainer.train()
 
-    # 10. Final Evaluation and Sample Inference (Run on Rank 0)
+    # 9. Final Evaluation on Test Set & Demo Inference
     test_results = trainer.evaluate(eval_dataset=tokenized_datasets["test"])
     
     if trainer.is_world_process_zero():
-        print("\n" + "=" * 65)
-        print("FINAL TEST EVALUATION (UNSEEN TEST SET)")
-        print("=" * 65)
+        print("=" * 94)
+        print("\n=== FINAL TEST EVALUATION (UNSEEN TEST SET) ===")
         print(f"Test Accuracy : {test_results['eval_accuracy'] * 100:.2f}%")
-        print(f"Test Macro F1 : {test_results['eval_macro_f1']:.4f}")
-        print("=" * 65 + "\n")
+        print(f"Test Macro F1 : {test_results['eval_macro_f1']:.4f}\n")
 
-        # Save the finalized model and tokenizer
         trainer.save_model(output_dir)
         tokenizer.save_pretrained(output_dir)
 
-        # 11. Live Pipeline Predictions
         print("=" * 65)
-        print("LIVE INFERENCE EXAMPLES")
+        print("DEMO INFERENCE ON NEW UNSEEN TEXT")
         print("=" * 65)
 
         classifier = pipeline(
@@ -190,17 +212,17 @@ def main():
             device=0
         )
 
-        test_sentences = [
-            "I am so proud of my sister for graduating with highest honors today!",
-            "I feel completely crushed, empty, and hopeless after that phone call.",
-            "I can't believe they broke their promise again, it makes my blood boil!",
-            "Hearing unexpected footsteps outside my door in the dark made my heart race.",
-            "Wait, you actually won the national championship? I never saw that coming!",
+        sample_sentences = [
+            "I am so proud of my sister for graduating with honors today!",
+            "I feel completely crushed, empty, and hopeless after that conversation.",
+            "I can't believe they broke their word again, it makes my blood boil!",
+            "Hearing footsteps outside my door in the dark made my heart race with panic.",
+            "Wait, you actually won first place? I never saw that coming at all!",
             "Holding your hand makes me realize how deeply I cherish you in my life."
         ]
 
-        results = classifier(test_sentences)
-        for sentence, result in zip(test_sentences, results):
+        results = classifier(sample_sentences)
+        for sentence, result in zip(sample_sentences, results):
             print(f"Input : \"{sentence}\"")
             print(f"Output: Emotion = {result['label'].upper():<10} | Confidence: {result['score'] * 100:.2f}%\n")
 
