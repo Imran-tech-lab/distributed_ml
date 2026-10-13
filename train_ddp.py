@@ -1,4 +1,12 @@
 import os
+import sys
+import warnings
+
+# 1. Suppress tqdm progress bars and PyTorch DDP synchronization warnings
+os.environ["TQDM_DISABLE"] = "1"
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 import inspect
 import torch
 import torch.nn as nn
@@ -19,18 +27,30 @@ from transformers import (
 )
 from transformers.trainer_callback import PrinterCallback
 
-# 1. Custom Callback for Table Formatting and Cross-Process GPU Profiling
+# 2. Callback for Formatted Table and Cross-GPU Memory Metrics
 class DistributedTableLoggerCallback(TrainerCallback):
     def __init__(self):
         self.header_printed = False
         self.latest_train_loss = None
+        self.in_training = False
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.in_training = True
+
+    def on_train_end(self, args, state, control, **kwargs):
+        self.in_training = False
+        if args.process_index == 0:
+            print("=" * 94 + "\n")
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        # Capture training loss from step/epoch logs
         if logs and "loss" in logs:
             self.latest_train_loss = logs["loss"]
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        # Prevent test-set evaluation from appending rows after training ends
+        if not self.in_training:
+            return
+
         # Synchronize and gather GPU metrics from Rank 0 and Rank 1
         dev = torch.cuda.current_device()
         torch.cuda.synchronize(dev)
@@ -50,24 +70,24 @@ class DistributedTableLoggerCallback(TrainerCallback):
                 print("=" * 94)
                 self.header_printed = True
 
-            epoch = int(state.epoch) if state.epoch is not None else 0
+            epoch = int(round(state.epoch)) if state.epoch is not None else 0
             tr_loss_str = f"{self.latest_train_loss:.4f}" if self.latest_train_loss is not None else "N/A"
             val_loss = metrics.get("eval_loss", 0.0)
             val_acc = metrics.get("eval_accuracy", 0.0)
             val_f1 = metrics.get("eval_macro_f1", 0.0)
 
-            # Sort gathered peaks by rank index
             gathered_peaks.sort(key=lambda x: x[0])
             g0_str = f"{gathered_peaks[0][1]:.0f} MB" if len(gathered_peaks) > 0 else "N/A"
             g1_str = f"{gathered_peaks[1][1]:.0f} MB" if len(gathered_peaks) > 1 else "N/A"
 
+            acc_str = f"{val_acc * 100:.2f}%"
             row = (
                 f"| {epoch:^7} | {tr_loss_str:^10} | {val_loss:^10.4f} | "
-                f"{val_acc * 100:^8.2f}% | {val_f1:^10.4f} | {g0_str:^12} | {g1_str:^12} |"
+                f"{acc_str:^9} | {val_f1:^10.4f} | {g0_str:^12} | {g1_str:^12} |"
             )
             print(row)
 
-# 2. Weighted Trainer Handling Class Imbalance
+# 3. Custom Trainer with Inverse Class Weighting
 class WeightedTrainer(Trainer):
     def __init__(self, class_weights=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -89,7 +109,7 @@ class WeightedTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 def main():
-    # 3. Label Map & Dataset Setup
+    # 4. Label Map & Dataset Setup
     id2label = {0: "sadness", 1: "joy", 2: "love", 3: "anger", 4: "fear", 5: "surprise"}
     label2id = {v: k for k, v in id2label.items()}
     num_labels = len(id2label)
@@ -100,7 +120,7 @@ def main():
     model_checkpoint = "roberta-base"
     tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
 
-    # 4. Balanced Inverse Class Weights
+    # 5. Inverse Class Weights to prevent bias toward dominant classes
     train_labels = np.array(dataset["train"]["labels"])
     computed_weights = compute_class_weight(
         class_weight="balanced",
@@ -115,7 +135,7 @@ def main():
     tokenized_datasets = dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-    # 5. Model Initialization
+    # 6. Model Initialization with Dropout Regularization
     model = AutoModelForSequenceClassification.from_pretrained(
         model_checkpoint,
         num_labels=num_labels,
@@ -135,7 +155,7 @@ def main():
         macro_f1 = f1_metric.compute(predictions=preds, references=labels, average="macro")["f1"]
         return {"accuracy": acc, "macro_f1": macro_f1}
 
-    # 6. Training Arguments
+    # 7. TrainingArguments Configuration
     output_dir = "./best_emotion_model"
     warmup_steps = 125
 
@@ -149,13 +169,13 @@ def main():
         "weight_decay": 0.05,
         "warmup_steps": warmup_steps,
         "fp16": True,
-        "ddp_find_unused_parameters": False,  # Silences DDP warning and optimizes autograd
+        "ddp_find_unused_parameters": False,
         "load_best_model_at_end": True,
         "metric_for_best_model": "macro_f1",
         "greater_is_better": True,
         "save_total_limit": 1,
         "logging_strategy": "epoch",
-        "disable_tqdm": True,                 # Disables raw console clutter for clean table printing
+        "disable_tqdm": True,
         "report_to": "none"
     }
 
@@ -167,14 +187,14 @@ def main():
 
     training_args = TrainingArguments(**training_args_dict)
 
-    # 7. Trainer Instantiation
+    # 8. Instantiate Trainer with processing_class
     trainer = WeightedTrainer(
         class_weights=class_weights_tensor,
         model=model,
         args=training_args,
         train_dataset=tokenized_datasets["train"],
         eval_dataset=tokenized_datasets["validation"],
-        processing_class=tokenizer,
+        processing_class=tokenizer,  # Replaces deprecated tokenizer=tokenizer
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         callbacks=[
@@ -183,18 +203,16 @@ def main():
         ]
     )
 
-    # Remove the default raw dictionary printer
     trainer.remove_callback(PrinterCallback)
 
-    # 8. Train Model
+    # 9. Execute Distributed Training
     trainer.train()
 
-    # 9. Final Evaluation on Test Set & Demo Inference
+    # 10. Final Evaluation on Unseen Test Set & Inference Demo
     test_results = trainer.evaluate(eval_dataset=tokenized_datasets["test"])
     
     if trainer.is_world_process_zero():
-        print("=" * 94)
-        print("\n=== FINAL TEST EVALUATION (UNSEEN TEST SET) ===")
+        print("=== FINAL TEST EVALUATION (UNSEEN TEST SET) ===")
         print(f"Test Accuracy : {test_results['eval_accuracy'] * 100:.2f}%")
         print(f"Test Macro F1 : {test_results['eval_macro_f1']:.4f}\n")
 
