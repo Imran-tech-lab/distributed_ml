@@ -37,13 +37,15 @@ def main():
     accelerator.print(f"=== Starting Distributed Training on {accelerator.num_processes} GPUs ===")
     accelerator.print(f"Distributed Backend: {accelerator.state.distributed_type}")
 
-    # 2. Multi-Class Review Dataset (5 classes: 0 to 4)
+    # 2. Dataset & Tokenizer Setup
     model_checkpoint = "bert-base-uncased"
     num_labels = 5
     tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
 
-    # Namespaced 5-class review sentiment dataset
     raw_datasets = load_dataset("SetFit/sst5")
+    # Rename 'label' -> 'labels' so BERT computes outputs.loss automatically
+    raw_datasets = raw_datasets.rename_column("label", "labels")
+
     train_subset = raw_datasets["train"].shuffle(seed=42)
     eval_subset = raw_datasets["test"].shuffle(seed=42)
 
@@ -51,8 +53,10 @@ def main():
         return tokenizer(batch["text"], truncation=True, max_length=128)
 
     with accelerator.main_process_first():
-        tokenized_train = train_subset.map(tokenize_fn, batched=True, remove_columns=["text"])
-        tokenized_eval = eval_subset.map(tokenize_fn, batched=True, remove_columns=["text"])
+        # Strip all metadata columns (including 'label_text') except 'labels'
+        cols_to_remove = [col for col in train_subset.column_names if col != "labels"]
+        tokenized_train = train_subset.map(tokenize_fn, batched=True, remove_columns=cols_to_remove)
+        tokenized_eval = eval_subset.map(tokenize_fn, batched=True, remove_columns=cols_to_remove)
 
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
@@ -69,30 +73,33 @@ def main():
         collate_fn=data_collator
     )
 
-    # 3. Model, Optimizer, and Learning Rate Scheduler
+    # 3. Model & Optimizer
     model = AutoModelForSequenceClassification.from_pretrained(
         model_checkpoint, 
         num_labels=num_labels
     )
-    
     optimizer = AdamW(model.parameters(), lr=3e-5, weight_decay=0.01)
+
+    # 4. Prepare distributed objects (wraps model in DDP and shards dataloaders)
+    model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
+        model, optimizer, train_dataloader, eval_dataloader
+    )
+
+    # 5. Learning Rate Scheduler (Calculated after DataLoader sharding)
     num_epochs = 3
-    total_training_steps = num_epochs * (len(train_dataloader) // accelerator.num_processes)
+    total_training_steps = num_epochs * len(train_dataloader)
     lr_scheduler = get_linear_schedule_with_warmup(
         optimizer, 
         num_warmup_steps=int(total_training_steps * 0.1), 
         num_training_steps=total_training_steps
     )
+    lr_scheduler = accelerator.prepare(lr_scheduler)
 
-    # 4. Prepare distributed objects (Wraps DDP, DistributedSampler, and GPU placement)
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
-    )
+    with accelerator.main_process_first():
+        accuracy_metric = evaluate.load("accuracy")
+        f1_metric = evaluate.load("f1")
 
-    accuracy_metric = evaluate.load("accuracy")
-    f1_metric = evaluate.load("f1")
-
-    # 5. Training Loop
+    # 6. Training Loop with Memory & Throughput Profiling
     for epoch in range(num_epochs):
         model.train()
         epoch_start_time = time.time()
@@ -121,16 +128,16 @@ def main():
             f"Avg Loss: {(running_loss / len(train_dataloader)):.4f}"
         )
 
-        # 6. Multi-GPU Distributed Evaluation
+        # 7. Distributed Evaluation
         model.eval()
         for batch in eval_dataloader:
             with torch.no_grad():
                 outputs = model(**batch)
             
             predictions = outputs.logits.argmax(dim=-1)
-            # Gather predictions across GPU 0 and GPU 1
+            # Gather tensor shards across GPU 0 and GPU 1
             gathered_preds, gathered_labels = accelerator.gather_for_metrics(
-                (predictions, batch["label"])
+                (predictions, batch["labels"])
             )
             accuracy_metric.add_batch(predictions=gathered_preds, references=gathered_labels)
             f1_metric.add_batch(predictions=gathered_preds, references=gathered_labels)
