@@ -15,45 +15,56 @@ from transformers import (
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
-def log_gpu_memory(accelerator, step_name=""):
-    """Collects VRAM usage across all ranks and prints cleanly from rank 0."""
+def print_table_header(accelerator):
+    separator = "+-------+------------+----------+----------+----------+-------------+-------------+----------+"
+    header    = "| Epoch | Train Loss | Val Loss | Accuracy | Macro F1 | GPU 0 Peak  | GPU 1 Peak  | Duration |"
+    accelerator.print(separator)
+    accelerator.print(header)
+    accelerator.print(separator)
+
+def print_table_row(accelerator, epoch, tr_loss, val_loss, acc, f1, g0_mem, g1_mem, duration):
+    row = (
+        f"| {epoch:^5} | {tr_loss:^10.4f} | {val_loss:^8.4f} | {acc * 100:^7.2f}% | "
+        f"{f1:^8.4f} | {g0_mem:^11} | {g1_mem:^11} | {duration:^6.1f}s |"
+    )
+    accelerator.print(row)
+
+def print_table_footer(accelerator):
+    separator = "+-------+------------+----------+----------+----------+-------------+-------------+----------+"
+    accelerator.print(separator)
+
+def get_peak_memory_per_gpu(accelerator):
+    """Gathers peak VRAM across both DDP ranks."""
     device = accelerator.device
     torch.cuda.synchronize(device)
+    peak_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
     
-    alloc = torch.cuda.memory_allocated(device) / (1024 ** 2)
-    max_alloc = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-    reserved = torch.cuda.memory_reserved(device) / (1024 ** 2)
+    gathered_peaks = accelerator.gather(torch.tensor([peak_mb], device=device, dtype=torch.float32))
+    peaks = gathered_peaks.cpu().numpy()
     
-    # Gather metrics across GPU 0 and GPU 1
-    local_metrics = torch.tensor([alloc, max_alloc, reserved], device=device, dtype=torch.float32)
-    all_metrics = accelerator.gather(local_metrics).view(-1, 3).cpu().numpy()
-    
-    if accelerator.is_main_process:
-        print(f"\n--- GPU Memory Profiling [{step_name}] ---")
-        for rank_id, (a, m, r) in enumerate(all_metrics):
-            print(
-                f"  GPU {rank_id} (Rank {rank_id}) -> "
-                f"Allocated: {a:7.1f} MB | Peak: {m:7.1f} MB | Reserved: {r:7.1f} MB"
-            )
+    gpu0_str = f"{peaks[0]:.0f} MB"
+    gpu1_str = f"{peaks[1]:.0f} MB" if len(peaks) > 1 else "N/A"
+    return gpu0_str, gpu1_str
 
 def main():
     # 1. Initialize Accelerator
     accelerator = Accelerator(mixed_precision="fp16")
     set_seed(42)
 
-    accelerator.print(f"=== Starting Distributed Training on {accelerator.num_processes} GPUs ===")
-    accelerator.print(f"Distributed Backend: {accelerator.state.distributed_type}")
+    accelerator.print(f"\n[DDP] Distributed training active on {accelerator.num_processes}x GPUs ({accelerator.state.distributed_type})")
 
-    # 2. Dataset & Tokenizer Setup (5-Class SST-5 Dataset)
+    # 2. Dataset: Official Yelp Reviews (5 Classes: 0 to 4 stars)
     model_checkpoint = "bert-base-uncased"
     num_labels = 5
     tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
 
-    raw_datasets = load_dataset("SetFit/sst5")
+    # Namespaced dataset path prevents HfUriError
+    raw_datasets = load_dataset("Yelp/yelp_review_full")
     raw_datasets = raw_datasets.rename_column("label", "labels")
 
-    train_subset = raw_datasets["train"].shuffle(seed=42)
-    eval_subset = raw_datasets["test"].shuffle(seed=42)
+    # Subsample 10k train and 2.5k test for fast turnaround
+    train_subset = raw_datasets["train"].shuffle(seed=42).select(range(10000))
+    eval_subset = raw_datasets["test"].shuffle(seed=42).select(range(2500))
 
     def tokenize_fn(batch):
         return tokenizer(batch["text"], truncation=True, max_length=128)
@@ -66,31 +77,17 @@ def main():
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
     batch_size = 32
-    train_dataloader = DataLoader(
-        tokenized_train, 
-        shuffle=True, 
-        batch_size=batch_size, 
-        collate_fn=data_collator
-    )
-    eval_dataloader = DataLoader(
-        tokenized_eval, 
-        batch_size=batch_size, 
-        collate_fn=data_collator
-    )
+    train_dataloader = DataLoader(tokenized_train, shuffle=True, batch_size=batch_size, collate_fn=data_collator)
+    eval_dataloader = DataLoader(tokenized_eval, batch_size=batch_size, collate_fn=data_collator)
 
-    # 3. Model, Optimizer, and Schedule Setup
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_checkpoint, 
-        num_labels=num_labels
-    )
-    optimizer = AdamW(model.parameters(), lr=3e-5, weight_decay=0.01)
+    # 3. Model, Optimizer, and LR Scheduler
+    model = AutoModelForSequenceClassification.from_pretrained(model_checkpoint, num_labels=num_labels)
+    optimizer = AdamW(model.parameters(), lr=2e-5, weight_decay=0.01)
 
-    # Prepare model, optimizer, and loaders across DDP ranks
     model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader
     )
 
-    # 4. Training Schedule: 10 Epochs
     num_epochs = 10
     total_training_steps = num_epochs * len(train_dataloader)
     lr_scheduler = get_linear_schedule_with_warmup(
@@ -103,20 +100,21 @@ def main():
     accuracy_metric = evaluate.load("accuracy")
     f1_metric = evaluate.load("f1")
 
-    accelerator.print(f"Total Epochs: {num_epochs} | Steps per Epoch: {len(train_dataloader)} | Total Steps: {total_training_steps}\n")
+    accelerator.print(f"[Info] Total epochs: {num_epochs} | Steps/epoch: {len(train_dataloader)} | Global batch size: {batch_size * accelerator.num_processes}\n")
+    print_table_header(accelerator)
 
-    # 5. Training Loop
+    # 4. Training & Validation Loop
     for epoch in range(num_epochs):
         model.train()
         epoch_start_time = time.time()
-        running_loss = 0.0
+        running_train_loss = 0.0
 
-        # Dedicated tqdm progress bar per epoch (visible only on GPU 0)
+        # leave=False clears the progress bar when finished so stdout stays clean
         train_bar = tqdm(
             train_dataloader, 
-            desc=f"Epoch {epoch + 1:02d}/{num_epochs:02d} [Train]", 
+            desc=f"Training Epoch {epoch + 1:02d}", 
             disable=not accelerator.is_local_main_process,
-            leave=True
+            leave=False
         )
 
         for step, batch in enumerate(train_bar):
@@ -127,28 +125,31 @@ def main():
             optimizer.step()
             lr_scheduler.step()
 
-            running_loss += loss.detach().float()
-            current_lr = lr_scheduler.get_last_lr()[0]
-            train_bar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{current_lr:.2e}"})
+            running_train_loss += loss.detach().float()
+            train_bar.set_postfix({"batch_loss": f"{loss.item():.4f}"})
 
         epoch_duration = time.time() - epoch_start_time
-        samples_processed = len(train_subset)
-        throughput = samples_processed / epoch_duration
-        avg_loss = (running_loss / len(train_dataloader)).item()
+        avg_train_loss = (running_train_loss / len(train_dataloader)).item()
 
-        # Multi-GPU Evaluation with Eval tqdm progress bar
+        # 5. Distributed Validation Pass
         model.eval()
-        eval_bar = tqdm(
-            eval_dataloader, 
-            desc=f"Epoch {epoch + 1:02d}/{num_epochs:02d} [Eval] ", 
-            disable=not accelerator.is_local_main_process,
-            leave=False
-        )
+        total_eval_loss = 0.0
+        total_eval_samples = 0
 
-        for batch in eval_bar:
+        for batch in eval_dataloader:
             with torch.no_grad():
                 outputs = model(**batch)
             
+            # Synchronize loss across both GPUs
+            batch_sz = batch["labels"].size(0)
+            loss_sum = outputs.loss * batch_sz
+            gathered_loss = accelerator.gather(loss_sum).sum()
+            gathered_count = accelerator.gather(torch.tensor(batch_sz, device=accelerator.device)).sum()
+
+            total_eval_loss += gathered_loss.item()
+            total_eval_samples += gathered_count.item()
+
+            # Gather predictions across GPU 0 and GPU 1
             predictions = outputs.logits.argmax(dim=-1)
             gathered_preds, gathered_labels = accelerator.gather_for_metrics(
                 (predictions, batch["labels"])
@@ -156,22 +157,28 @@ def main():
             accuracy_metric.add_batch(predictions=gathered_preds, references=gathered_labels)
             f1_metric.add_batch(predictions=gathered_preds, references=gathered_labels)
 
+        avg_val_loss = total_eval_loss / total_eval_samples
         eval_acc = accuracy_metric.compute()["accuracy"]
         eval_f1 = f1_metric.compute(average="macro")["f1"]
 
-        accelerator.wait_for_everyone()
-        log_gpu_memory(accelerator, step_name=f"Epoch {epoch + 1}/{num_epochs}")
+        # Gather peak VRAM metrics
+        gpu0_peak, gpu1_peak = get_peak_memory_per_gpu(accelerator)
 
-        accelerator.print(
-            f"--> Epoch {epoch + 1:02d}/{num_epochs:02d} Summary: "
-            f"Accuracy = {eval_acc * 100:.2f}% | "
-            f"Macro F1 = {eval_f1:.4f} | "
-            f"Avg Loss = {avg_loss:.4f} | "
-            f"Throughput = {throughput:.2f} samples/sec | "
-            f"Duration = {epoch_duration:.2f}s\n"
+        # Print the clean table row
+        print_table_row(
+            accelerator,
+            epoch=epoch + 1,
+            tr_loss=avg_train_loss,
+            val_loss=avg_val_loss,
+            acc=eval_acc,
+            f1=eval_f1,
+            g0_mem=gpu0_peak,
+            g1_mem=gpu1_peak,
+            duration=epoch_duration
         )
 
-    accelerator.print("=== Distributed Training Finished Successfully ===")
+    print_table_footer(accelerator)
+    accelerator.print("\n=== Distributed Training Complete ===")
     accelerator.end_training()
 
 if __name__ == "__main__":
