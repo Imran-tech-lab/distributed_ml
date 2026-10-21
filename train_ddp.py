@@ -215,7 +215,7 @@ def main():
         "output_dir": output_dir,
         "save_strategy": "epoch",
         "learning_rate": 2e-5,
-        "per_device_train_batch_size": 64,
+        "per_device_train_batch_size": 128,
         "per_device_eval_batch_size": 128,
         "num_train_epochs": 5,
         "num_train_epochs": 3,
