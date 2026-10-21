@@ -220,7 +220,7 @@ def main():
     "per_device_eval_batch_size": 128,
     "num_train_epochs": 3,
     "weight_decay": 0.05,
-    "warmup_ratio": 0.06,               # scales with the number of training steps
+    # "warmup_ratio": 0.06,               # scales with the number of training steps
     "fp16": True,
     "ddp_find_unused_parameters": False,
     "load_best_model_at_end": True,
