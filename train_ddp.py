@@ -183,8 +183,7 @@ def main():
 
     tokenized_datasets = dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
     data_collator = DataCollatorWithPadding(
-    tokenizer=tokenizer,
-    pad_to_multiple_of=8,
+    tokenizer=tokenizer
 )
 
 
@@ -213,27 +212,25 @@ def main():
     warmup_steps = 125
 
     training_args_dict = {
-    "output_dir": output_dir,
-    "save_strategy": "epoch",
-    "learning_rate": 2e-5,
-    "per_device_train_batch_size": 64,  # was 32; applies to each GPU
-    "per_device_eval_batch_size": 128,
-    "num_train_epochs": 3,
-    "weight_decay": 0.05,
-    # "warmup_ratio": 0.06,               # scales with the number of training steps
-    "fp16": True,
-    "ddp_find_unused_parameters": False,
-    "load_best_model_at_end": True,
-    "metric_for_best_model": "macro_f1",
-    "greater_is_better": True,
-    "save_total_limit": 1,
-    "logging_strategy": "epoch",
-    "disable_tqdm": True,
-    "report_to": "none",
-    "dataloader_num_workers": 4,
-    "dataloader_pin_memory": True,
-    "group_by_length": True,
-}
+        "output_dir": output_dir,
+        "save_strategy": "epoch",
+        "learning_rate": 2e-5,
+        "per_device_train_batch_size": 64,
+        "per_device_eval_batch_size": 128,
+        "num_train_epochs": 5,
+        "num_train_epochs": 3,
+        "weight_decay": 0.05,
+        "warmup_steps": warmup_steps,
+        "fp16": True,
+        "ddp_find_unused_parameters": False,
+        "load_best_model_at_end": True,
+        "metric_for_best_model": "macro_f1",
+        "greater_is_better": True,
+        "save_total_limit": 1,
+        "logging_strategy": "epoch",
+        "disable_tqdm": True,
+        "report_to": "none"
+    }
 
     sig = inspect.signature(TrainingArguments.__init__).parameters
     if "eval_strategy" in sig:
